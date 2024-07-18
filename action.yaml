@@ -1,0 +1,102 @@
+name: 'Run Snyk Tests for Dependencies'
+description: 'Run Snyk Checks for dependencies in container (with prepared environment). Snyk should be available in the container used'
+inputs:
+  image:
+    description: 'Docker image to run tests'
+    required: true
+  entrypoint: 
+    description: 'Entrypoint to be used to run the command (shell)'
+    required: true
+    default: /bin/sh
+  snyk-token:
+    description: 'Snyk Auth token'
+    type: string
+    required: true
+
+runs:
+  using: composite
+  steps:
+    
+    - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 #v4.1.1
+    - name: Dependency Check For Vulnerabilities(snyk)
+      id: dep_snyk_scan
+      if: github.event_name == 'pull_request'
+      shell: bash
+      run: |
+        docker run --name snyk_container  \
+        -e SNYK_TOKEN=${{ inputs.snyk-token }} \
+        --entrypoint ${{ inputs.entrypoint }} ${{ inputs.image }} \
+        -c "snyk test --all-sub-projects --json-file-output=snyk_results.json ; echo \$? > exit_code ; cat exit_code"
+        container_work_dir=$( docker image inspect -f '{{.Config.WorkingDir}}' ${{ inputs.image }} )
+        exit_code=$(docker cp snyk_container:$container_work_dir/exit_code - | tr -d '\r')
+        cat exit_code
+        echo "exitcode=$exit_code" >> $GITHUB_OUTPUT
+      continue-on-error: true
+    
+    - name: Copy Results From the Container
+      shell: bash
+      run: |
+        container_work_dir=$( docker image inspect -f '{{.Config.WorkingDir}}' ${{ inputs.image }} )
+        docker cp snyk_container:$container_work_dir/snyk_results.json .
+        if [ $? -eq 0 ]; then
+            echo "File copied successfully."
+        else
+            echo "Failed to copy file."
+        fi 
+        docker rm snyk_container
+      continue-on-error: true
+
+
+    - name: Upload Dependency Vulnerability Scan Results(snyk)
+      shell: bash
+      if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', inputs.report-branch)
+      run: |
+        docker run --rm  \
+        -e SNYK_TOKEN=${{ inputs.snyk-token }} \
+        --entrypoint ${{ inputs.entrypoint }} ${{ inputs.image }} \
+        -c "snyk monitor --all-sub-projects"
+      continue-on-error: ${{ inputs.ignore-errors == 'true'}}
+      
+    - name: Check if snyk succeeded
+      if: github.event_name == 'pull_request' && inputs.ignore-errors == 'false' && steps.dep_snyk_scan.outputs.exitcode != 0 && steps.dep_snyk_scan.outputs.exitcode != 1
+      shell: bash
+      run: echo "Snyk scan failed. Please check the previous stage for details" && exit 1
+     
+  
+    - name: Install jq           
+      uses: dcarbone/install-jq-action@v2.1.0
+    
+    - name: Process snyk results
+      id: snyk_filter_new_issues
+      if: github.event_name == 'pull_request'
+      shell: bash
+      run: |
+        set +e
+        echo '**Snyk Dependency Scan Results**' > new_dep_vulns_summary.txt
+        echo '```diff' >> new_dep_vulns_summary.txt
+        bash ${{ github.action_path }}/snyk-delta.sh snyk_results.json  >> new_dep_vulns_summary.txt 
+        echo "exitcode=$?" >> $GITHUB_OUTPUT
+        sed -i -e '/Low/,/^$/ s/^/# /' -e '/Low/,/^$/ !{
+        /High/s/^/- /
+        /Critical/s/^/- /
+        /Fixed/s/^/+ /
+        /Fixable/s/^/+ /
+        /Via/s/^/! /
+        }' new_dep_vulns_summary.txt
+        echo '```' >> new_dep_vulns_summary.txt
+        cat new_dep_vulns_summary.txt
+      env:
+          SNYK_TOKEN: ${{ inputs.snyk-token }}
+      continue-on-error: true
+    
+    - name: Check if snyk-delta succeeded
+      if: github.event_name == 'pull_request' && inputs.ignore-errors == 'false' && steps.snyk_filter_new_issues.outputs.exitcode != 0 && steps.snyk_filter_new_issues.outputs.exitcode != 1
+      shell: bash
+      run: echo "Snyk-delta failed to filter results. Please check the previous stage for details" && exit 1
+
+    - name: Add PR Comment with results
+      if: github.event_name == 'pull_request' && (steps.snyk_filter_new_issues.outputs.exitcode == 0 || steps.snyk_filter_new_issues.outputs.exitcode == 1)
+      uses: thollander/actions-comment-pull-request@fabd468d3a1a0b97feee5f6b9e499eab0dd903f6 #v2.5.0
+      with:
+        filePath: new_dep_vulns_summary.txt
+        comment_tag: snyk_dep_scan_results
